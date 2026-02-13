@@ -82,8 +82,7 @@ class KnowledgeBaseService(object):
         """
         md5_hex = get_string_md5(data) #获取数据字符串的md5值
         if check_md5(md5_hex):
-            print(f"{filename} has been processed before, skip it.")
-            return
+            return f"{filename}上传过了，跳过."
         
         #文本切分
         if len(data) > config.max_spilter_char_number:
@@ -100,4 +99,4 @@ class KnowledgeBaseService(object):
         
         self.chroma.add_texts(knowledge, metadatas=[metadata for _ in knowledge]) #向量化并保存到数据库中
         save_md5(md5_hex) #保存md5值到文件中
-        return "Upload success."
+        return "上传成功，内容已经加载到知识库中"
