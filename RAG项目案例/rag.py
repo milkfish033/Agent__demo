@@ -55,10 +55,10 @@ class RagService(object):
             return prompt
             
 
-        def tmp(value):
+        def format_for_retriever(value):
             return value["question"]
             
-        def tmp2(value):
+        def format_for_template(value):
             new_dict = {}
             new_dict["question"] = value["question"]["question"]
             new_dict["context"] = value["context"]
@@ -68,8 +68,8 @@ class RagService(object):
         chain = (
             {
                 "question": RunnablePassthrough(),
-                "context": RunnableLambda(tmp) | retriever | format_document
-            } | RunnableLambda(tmp2) | self.prompt_template | print_prompt | self.chat_model | StrOutputParser()
+                "context": RunnableLambda(format_for_retriever) | retriever | format_document
+            } | RunnableLambda(format_for_template) | self.prompt_template| print_prompt| self.chat_model | StrOutputParser()
         )
 
     
@@ -87,9 +87,6 @@ class RagService(object):
 
 
 if __name__ == "__main__":
-    # res = RagService().chain.invoke("沈明宇的做过哪些项目")
-    # print(res)
-
     #session_id 
     session_config = {
         "configurable": {
@@ -98,7 +95,7 @@ if __name__ == "__main__":
     }
 
     res = RagService()._get_chain().invoke(
-        {"question": "沈明宇的专业是什么？"},
+        {"question": "沈的年龄多大？"},
         session_config
     )
     print(res)
