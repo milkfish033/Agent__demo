@@ -1,221 +1,260 @@
-import operator
-from typing import Annotated, Literal
-from typing_extensions import NotRequired, TypedDict
-from pydantic import BaseModel, Field
+"""
+ReWOO — Reasoning Without Observation
+======================================
+架构：Planner → Worker → Solver（线性三段式）
 
-from langchain_core.tools import tool
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
-from langchain_core.tools import InjectedToolCallId
+LLM 显式调用次数：2（Planner 1次 + Solver 1次）
+工具调用次数：O(k)，k 为规划步骤数
+"""
 
-from langchain.agents import create_agent
-from langchain.agents.middleware import dynamic_prompt
+import re
+import ast
+import math
+import operator as op
+from typing import TypedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.types import Command
 from langchain_community.chat_models.tongyi import ChatTongyi
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_community.tools import WikipediaQueryRun
+from langchain_community.utilities import WikipediaAPIWrapper
 
-# 1) Shared state across parent + subgraphs
-class OrchestratorState(TypedDict):
-    messages: Annotated[list, add_messages]
-    tasks: Annotated[list[str], operator.add]
-    artifacts: Annotated[list[str], operator.add]
-    current_task: NotRequired[str]
-    next_node: NotRequired[Literal["research", "write", "finalize"]]
+from langgraph.graph import StateGraph, START, END
 
+from smolagents import WebSearchTool
 
-# 2) Sub-agent shared tools
-@tool
-def add_task(
-    task: str,
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> Command:
-    """将任务追加到任务列表中。"""
-    return Command(update={
-        "tasks": [task],
-        "messages": [ToolMessage(f"任务已添加：{task}", tool_call_id=tool_call_id)],
-    })
+from utils.prompt_loader import planner_prompt, solver_prompt
 
 
-@tool
-def save_artifact(
-    content: str,
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> Command:
-    """将内容（笔记、片段、参考资料）保存到短期记忆中。"""
-    return Command(update={
-        "artifacts": [content],
-        "messages": [ToolMessage("成果已保存。", tool_call_id=tool_call_id)],
-    })
+# ── LLM ───────────────────────────────────────────────────────────────────────
+
+llm = ChatTongyi(model="qwen3-max")
 
 
-# 3) Planner — custom node with structured output (one decision per turn)
-class PlannerDecision(BaseModel):
-    reasoning: str = Field(description="用中文说明当前进度和决策依据")
-    action: Literal["research", "write", "finalize"] = Field(description="下一步行动")
-    new_tasks: list[str] = Field(default=[], description="新增任务（仅 action=research 时填写）")
+# ── Tools ─────────────────────────────────────────────────────────────────────
+
+_web_search_tool = WebSearchTool()
+
+_wiki = WikipediaQueryRun(
+    api_wrapper=WikipediaAPIWrapper(top_k_results=2, doc_content_chars_max=2000)
+)
+
+# 安全计算器允许的运算符
+_SAFE_OPS = {
+    ast.Add: op.add, ast.Sub: op.sub,
+    ast.Mult: op.mul, ast.Div: op.truediv,
+    ast.Pow: op.pow,  ast.USub: op.neg,
+}
+_SAFE_NAMES = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
 
 
-def build_planner():
-    model = ChatTongyi(model="qwen3-max")
-    decision_model = model.with_structured_output(PlannerDecision)
-
-    def planner_node(state: OrchestratorState):
-        artifacts = state.get("artifacts", [])
-        tasks = state.get("tasks", [])
-        current_stage = state.get("next_node")  # 记录上一轮路由到哪里
-        messages = list(state["messages"])
-
-        system = SystemMessage(content=(
-            "你是一个规划者，负责制定执行计划并根据子智能体的结果动态调整。\n"
-            f"当前执行阶段：{current_stage or '初始（尚未开始）'}\n"
-            f"当前任务列表：{tasks}\n"
-            f"已保存成果数：{len(artifacts)}\n"
-            "决策规则（严格按阶段判断，不要分析消息内容）：\n"
-            "1. 若阶段为 None/初始 → 选择 'research'，在 new_tasks 中制定2-3个调研子任务\n"
-            "2. 若阶段为 'research'（调研刚完成）→ 评估调研结果，若符合预期则选择 'write'，\n"
-            "   若不符合可更新 new_tasks 并再次选择 'research'\n"
-            "3. 若阶段为 'write'（写作刚完成）→ 评估写作结果，符合预期则选择 'finalize'，\n"
-            "   否则可再次选择 'write'\n"
-            "请用中文填写 reasoning，说明对上一步结果的评估和下一步决策。"
-        ))
-
-        decision = decision_model.invoke([system] + messages)
-        update = {
-            "next_node": decision.action,
-            "messages": [AIMessage(content=f"[规划] {decision.reasoning}")],
-        }
-        if decision.new_tasks:
-            update["tasks"] = decision.new_tasks
-        return update
-
-    return planner_node
+def _web_search(query: str) -> str:
+    return str(_web_search_tool(query))
 
 
-# 4) Research agent (simple stub tools)
-@tool
-def web_search(query: str) -> str:
-    """网络搜索（存根）；如需真实集成请替换实现。"""
-    return f"[搜索结果] 关于'{query}'的摘要内容。"
+def _wikipedia(query: str) -> str:
+    return _wiki.run(query)
 
 
-@dynamic_prompt
-def research_prompt(request):
-    return (
-        "你是一个研究助手，负责使用可用工具进行调研并生成简洁笔记。\n"
-        "完成后，用中文向规划者总结调研结果。"
-    )
+def _llm_reason(prompt: str) -> str:
+    return llm.invoke([HumanMessage(content=prompt)]).content
 
 
-def build_research_agent():
-    model  = ChatTongyi(model="qwen3-max")
-    return create_agent(
-        model=model,
-        tools=[web_search, save_artifact],  # can save notes back into state
-        middleware=[research_prompt],
-        state_schema=OrchestratorState,
-        name="research_agent",
-    )
+def _calculator(expression: str) -> str:
+    def _eval(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in _SAFE_NAMES:
+                return _SAFE_NAMES[node.id]
+            raise ValueError(f"不允许的名称: {node.id}")
+        if isinstance(node, ast.BinOp):
+            return _SAFE_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp):
+            return _SAFE_OPS[type(node.op)](_eval(node.operand))
+        raise ValueError(f"不支持的表达式类型: {ast.dump(node)}")
+
+    try:
+        tree = ast.parse(expression.strip(), mode="eval")
+        return str(_eval(tree.body))
+    except Exception as e:
+        return f"计算错误: {e}"
 
 
-# 5) Writer agent (simple stub tools)
-@tool
-def draft_section(topic: str) -> str:
-    """为最终输出起草一个简短章节。"""
-    return f"[草稿] 关于'{topic}'的简洁章节内容。"
+TOOL_MAP = {
+    "web_search": _web_search,
+    "Wikipedia":  _wikipedia,
+    "LLM":        _llm_reason,
+    "Calculator": _calculator,
+}
 
 
-@dynamic_prompt
-def writer_prompt(request):
-    return (
-        "你是一个写作助手，负责根据任务、成果和消息记录起草简洁内容。\n"
-        "请用中文撰写简短章节，避免冗余。"
-    )
+# ── State ─────────────────────────────────────────────────────────────────────
+
+class ReWOOState(TypedDict):
+    task:        str   # 原始用户任务
+    plan_string: str   # Planner 原始输出文本
+    steps:       list  # [(plan_desc, "#E1", "tool_name", "tool_input"), ...]
+    results:     dict  # {"#E1": "actual result", ...}
+    result:      str   # Solver 最终答案
 
 
-def build_writer_agent():
-    model  = ChatTongyi(model="qwen3-max")
-    return create_agent(
-        model=model,
-        tools=[draft_section, save_artifact],
-        middleware=[writer_prompt],
-        state_schema=OrchestratorState,
-        name="writer_agent",
-    )
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_PLAN_RE = re.compile(
+    r"Plan:\s*(.+?)\n#(E\d+)\s*=\s*(\w+)\[(.+?)\]",
+    re.DOTALL,
+)
 
 
-# 6) Parent orchestrator graph wiring
-def build_plan_tasks_and_execute():
-    planner = build_planner()
-    researcher = build_research_agent()
-    writer = build_writer_agent()
-
-    builder = StateGraph(OrchestratorState)
-    builder.add_node("planner", planner)
-    builder.add_node("research_agent", researcher)
-    builder.add_node("writer_agent", writer)
-
-    def route_from_planner(state: OrchestratorState):
-        action = state.get("next_node")
-        if action == "research":
-            return "research_agent"
-        if action == "write":
-            return "writer_agent"
-        return END
-
-    builder.add_edge(START, "planner")
-    builder.add_conditional_edges("planner", route_from_planner, ["research_agent", "writer_agent", END])
-    builder.add_edge("research_agent", "planner")
-    builder.add_edge("writer_agent", "planner")
-
-    checkpointer = MemorySaver()
-    return builder.compile(checkpointer=checkpointer)
+def _clean_plan(text: str) -> str:
+    """去掉 qwen3 的 <think>...</think> 块和 markdown 代码围栏。"""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"```[^\n]*\n?", "", text)
+    return text.strip()
 
 
-if __name__ == "__main__":
-    graph = build_plan_tasks_and_execute()
-    config = {"configurable": {"thread_id": "demo-1"}}
+def _parse_plan(plan_string: str) -> list:
+    """将 Planner 输出解析为步骤列表。
 
-    inputs = {
-        "messages": [
-            {
-                "role": "user",
-                "content": "目标：针对'美股市场2026行情'生成一份包含3个要点的简短总结。先调研，再撰写。",
-            }
-        ],
-        "tasks": [],
-        "artifacts": [],
+    Returns:
+        list of (plan_desc, "#E1", "tool_name", "tool_input")
+    """
+    return [
+        (plan.strip(), f"#{var}", tool.strip(), inp.strip())
+        for plan, var, tool, inp in _PLAN_RE.findall(plan_string)
+    ]
+
+
+def _substitute(text: str, results: dict) -> str:
+    """将 text 中的 #Ei 引用替换为 results 中的实际值。"""
+    for var, val in results.items():
+        text = text.replace(var, val)
+    return text
+
+
+# ── Nodes ─────────────────────────────────────────────────────────────────────
+
+def planner_node(state: ReWOOState) -> dict:
+    """一次性生成包含所有步骤的完整执行蓝图（DAG）。"""
+    response = llm.invoke([
+        SystemMessage(content=planner_prompt),
+        HumanMessage(content=state["task"]),
+    ])
+    plan_string = _clean_plan(response.content)
+    steps = _parse_plan(plan_string)
+    return {
+        "plan_string": plan_string,
+        "steps": steps,
+        "results": {},
     }
 
-    seen_ids: set = set()
 
-    def print_new_messages(msgs):
-        for msg in msgs:
-            msg_id = getattr(msg, "id", None) or id(msg)
-            if msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
-            role = getattr(msg, "type", type(msg).__name__)
-            content = getattr(msg, "content", "")
-            if content:
-                print(f"  [{role}] {content}")
+def _get_deps(tool_input: str) -> set:
+    """提取 tool_input 中引用的所有 #Ei 变量名。"""
+    return set(re.findall(r"#E\d+", tool_input))
 
-    print("=" * 50)
-    for step in graph.stream(inputs, config, stream_mode="updates"):
-        for node_name, update in step.items():
-            msgs = update.get("messages", [])
-            new_msgs = [m for m in msgs if (getattr(m, "id", None) or id(m)) not in seen_ids]
-            has_extra = any(k in update for k in ("tasks", "artifacts", "next_node"))
-            if not new_msgs and not has_extra:
-                continue
-            print(f"\n>>> 节点：{node_name}")
-            print_new_messages(msgs)
-            if "tasks" in update and update["tasks"]:
-                print(f"  [任务列表] {update['tasks']}")
-            if "artifacts" in update and update["artifacts"]:
-                print(f"  [成果] {update['artifacts']}")
-            if "next_node" in update:
-                print(f"  [下一步] → {update['next_node']}")
-    print("\n" + "=" * 50)
-    print("流程结束")
+
+def worker_node(state: ReWOOState) -> dict:
+    """按 DAG 依赖关系执行工具，同一批次内并行，跨批次顺序。
+
+    算法：
+      1. 找出当前所有依赖已满足的步骤（ready wave）
+      2. 用 ThreadPoolExecutor 并行执行这一批
+      3. 将结果写入 results，重复直到所有步骤完成
+    """
+    # 以 variable 为 key 建立索引
+    step_map = {var: (tool, inp) for _, var, tool, inp in state["steps"]}
+    # 保持 Planner 原始顺序（用于 Solver 整合时按序展示）
+    order = [var for _, var, _, _ in state["steps"]]
+
+    results: dict = {}
+    pending = list(order)
+
+    while pending:
+        # 当前轮次中依赖已全部就绪的步骤
+        ready = [
+            var for var in pending
+            if _get_deps(step_map[var][1]).issubset(results.keys())
+        ]
+
+        def _run(var: str) -> tuple[str, str]:
+            tool_name, tool_input = step_map[var]
+            resolved = _substitute(tool_input, results)
+            fn = TOOL_MAP.get(tool_name, lambda q: f"[未知工具: {tool_name}，输入: {q}]")
+            return var, str(fn(resolved))
+
+        with ThreadPoolExecutor(max_workers=len(ready)) as executor:
+            futures = {executor.submit(_run, var): var for var in ready}
+            for future in as_completed(futures):
+                var, output = future.result()
+                results[var] = output
+                print(f"  {var} [{step_map[var][0]}] → {output[:150]}")
+
+        for var in ready:
+            pending.remove(var)
+
+    return {"results": results}
+
+
+def solver_node(state: ReWOOState) -> dict:
+    """整合所有 (Plan_i, Evidence_i) 对，输出最终答案。"""
+    evidence_parts = []
+    for plan_desc, variable, _, _ in state["steps"]:
+        evidence = state["results"].get(variable, "[无结果]")
+        evidence_parts.append(f"计划: {plan_desc}\n{variable}: {evidence}")
+
+    evidence_text = "\n\n".join(evidence_parts)
+    user_msg = (
+        f"任务: {state['task']}\n\n"
+        f"执行结果:\n{evidence_text}\n\n"
+        f"请给出最终答案:"
+    )
+
+    response = llm.invoke([
+        SystemMessage(content=solver_prompt),
+        HumanMessage(content=user_msg),
+    ])
+    return {"result": response.content}
+
+
+# ── Graph ─────────────────────────────────────────────────────────────────────
+
+def build_rewoo():
+    """构建 ReWOO 线性图：START → planner → worker → solver → END"""
+    builder = StateGraph(ReWOOState)
+    builder.add_node("planner", planner_node)
+    builder.add_node("worker",  worker_node)
+    builder.add_node("solver",  solver_node)
+
+    builder.add_edge(START,     "planner")
+    builder.add_edge("planner", "worker")
+    builder.add_edge("worker",  "solver")
+    builder.add_edge("solver",  END)
+
+    return builder.compile()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    graph = build_rewoo()
+
+    task = "分析2026年美股市场走向"
+
+    print("=" * 60)
+    print(f"任务: {task}")
+    print("=" * 60)
+
+    result = graph.invoke({"task": task})
+
+    print("\n── Planner 蓝图 ──")
+    print(result["plan_string"])
+
+    print("\n── Worker 执行结果 ──")
+    for var, val in result["results"].items():
+        print(f"  {var}: {val[:300]}")
+
+    print("\n── Solver 最终答案 ──")
+    print(result["result"])
+    print("=" * 60)
